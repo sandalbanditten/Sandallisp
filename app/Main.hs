@@ -5,6 +5,7 @@ import System.Environment
 import Numeric (readOct, readHex, readFloat)
 import Data.Ratio ((%))
 import Data.Complex
+import Data.Array
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -28,6 +29,7 @@ data LispVal
   | String String
   | Bool Bool
   | Character Char
+  | Vector (Array Int LispVal)
 
 parseBool :: Parser LispVal
 parseBool = do
@@ -155,6 +157,44 @@ bin2dig' digint "" = digint
 bin2dig' digint (x:xs) = bin2dig' old xs
   where old = 2 * digint + (if x == '0' then 0 else 1)
 
+parseList :: Parser LispVal
+parseList = List <$> sepBy parseExpr spaces
+
+parseDottedList :: Parser LispVal
+parseDottedList = do
+  h <- endBy parseExpr spaces
+  t <- char '.' >> spaces >> parseExpr
+  return $ DottedList h t
+
+parseQuoted :: Parser LispVal
+parseQuoted = do
+  _ <- char '\''
+  x <- parseExpr
+  return $ List [Atom "quote", x]
+
+parseQuasiQuoted :: Parser LispVal
+parseQuasiQuoted = do
+  _ <- char '`'
+  x <- parseExpr
+  return $ List [Atom "quasiquote", x]
+
+parseUnQuote :: Parser LispVal
+parseUnQuote = do
+  _ <- char ','
+  x <- parseExpr
+  return $ List [Atom "unquote", x]
+
+parseUnQuoteSplicing :: Parser LispVal
+parseUnQuoteSplicing = do
+  _ <- char ','
+  _ <- char '@'
+  x <- parseExpr
+  return $ List [Atom "unquote-splicing", x]
+
+parseVector :: Parser LispVal
+parseVector = do arrayVals <- sepBy parseExpr spaces
+                 return $ Vector (listArray (0, (length arrayVals - 1)) arrayVals)
+
 parseExpr :: Parser LispVal
 parseExpr = parseAtom
          <|> parseString
@@ -166,6 +206,18 @@ parseExpr = parseAtom
          <|> try parseNumber
          <|> try parseBool
          <|> try parseCharacter
+         <|> parseQuoted
+         <|> parseQuasiQuoted
+         <|> parseUnQuote
+         <|> parseUnQuoteSplicing
+         <|> try (do _ <- string "#("
+                     v <- parseVector
+                     _ <- char ')'
+                     return v)
+         <|> do _ <- char '('
+                x <- try parseList <|> parseDottedList
+                _ <- char ')'
+                return x
 
 main :: IO ()
 main = do

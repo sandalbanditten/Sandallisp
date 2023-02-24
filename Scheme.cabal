@@ -6,9 +6,7 @@ version:            0.1.0.0
 -- synopsis:
 
 -- A longer description of the package.
--- description:
-    A Scheme parser (and soon compiler),
-    from the book "Write Yourself a Scheme in 48 Hours"
+-- description: A Scheme parser (and soon compiler), from the book "Write Yourself a Scheme in 48 Hours"
 
 -- A URL where users can report bugs.
 -- bug-reports:
@@ -33,6 +31,7 @@ executable Scheme
     -- other-extensions:
     build-depends:
         base ^>=4.15.1.0,
-        parsec
+        parsec,
+        array
     hs-source-dirs:   app
     default-language: Haskell2010
