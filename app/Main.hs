@@ -8,6 +8,7 @@ import           System.Environment
 import           Text.ParserCombinators.Parsec hiding (spaces)
 import           Data.Functor ((<&>))
 import           System.IO
+import           Data.IORed
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -463,10 +464,18 @@ until_ pred prompt action = do
 runRepl :: IO ()
 runRepl = until_ (== "quit") (readPrompt "Scheme λ: ") evalAndPrint
 
+type Env = IORef [(String, IORef LispVal)]
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+-- a combined monad for LispErrors and IO
+type IOThrowsError = ExceptT LispError IO
+
 main :: IO ()
 main = do
   args <- getArgs
   case length args of
     0 -> runRepl
     1 -> evalAndPrint $ head args
-    otherwise -> putStrLn "No args to run REPL, 1 arg to evaluate it"
+    _ -> putStrLn "No args to run REPL, 1 arg to evaluate it"
