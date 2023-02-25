@@ -1,5 +1,3 @@
-{-# LANGUAGE ExistentialQuantification #-}
-
 module Main where
 
 import           Control.Monad.Except
@@ -8,7 +6,8 @@ import           System.Environment
 import           Text.ParserCombinators.Parsec hiding (spaces)
 import           Data.Functor ((<&>))
 import           System.IO
-import           Data.IORed
+import           Data.IORef
+import           Data.Maybe (isJust)
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -76,6 +75,7 @@ showError (TypeMismatch expected found) = "Invalid type: expected "
                                         ++ ", found "
                                         ++ show found
 showError (Parser parseErr)             = "Parse error at " ++ show parseErr
+showError (Default str)                 = "Defaulting error " ++ str
 
 instance Show LispError where show = showError
 
@@ -134,7 +134,7 @@ parseAtom :: Parser LispVal
 parseAtom = do
   first <- letter <|> symbol
   rest <- many $ letter <|> digit <|> symbol
-  let atom = first : rest
+  let atom = first:rest
   return $ case atom of
     "#t" -> Bool True
     "#f" -> Bool False
@@ -291,26 +291,38 @@ parseExpr = parseAtom
                 _ <- char ')'
                 return x
 
-eval :: LispVal -> ThrowsError LispVal
-eval val@(String _)              = return val
-eval val@(Number _)              = return val
-eval val@(Bool _)                = return val
-eval (List [Atom "quote", val])  = return val
-eval (List [Atom "if", p, a, b]) = -- if p then a else b
+eval :: Env -> LispVal -> IOThrowsError LispVal
+eval _ val@(String _)
+  = return val
+eval _ val@(Number _)
+  = return val
+eval _ val@(Bool _)
+  = return val
+eval env (Atom ident)
+  = getVar env ident
+eval _ (List [Atom "quote", val])
+  = return val
+eval env (List [Atom "if", p, a, b])
+  -- if p then a else b
   -- will evaluate #f as False and *everything* else as True
-  do result <- eval p
-     case result of
-          Bool False -> eval b
-          _          -> eval a
-eval (List (Atom func : args))   = mapM eval args >>= apply func
-eval badForm                     = throwError
-                                 $ BadSpecialForm "Unrecognized special form" badForm
+  = do result <- eval env p
+       case result of
+            Bool False -> eval env b
+            _          -> eval env a
+eval env (List [Atom "set!", Atom var, form])
+  = eval env form >>= setVar env var
+eval env (List [Atom "define", Atom var, form])
+  = eval env form >>= defVar env var
+eval env (List (Atom func:args))
+  = mapM (eval env) args >>= liftThrows . apply func
+eval _ badForm
+  = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 apply :: String -> [LispVal] -> ThrowsError LispVal
-apply func args = maybe
-  (throwError $ NotFunction "Unrecognized primitive function args" func)
+apply fn args = maybe
+  (throwError $ NotFunction "Unrecognized primitive function args" fn)
   ($ args)
-  (lookup func primitives)
+  (lookup fn primitives)
 
 car :: [LispVal] -> ThrowsError LispVal
 car [List (x:_)]         = return x
@@ -447,22 +459,22 @@ flushStr = (>> hFlush stdout) . putStr
 readPrompt :: String -> IO String
 readPrompt = (>> getLine) . flushStr
 
-evalString :: String -> IO String
-evalString = return . extractValue . trapError . fmap show . (eval <=< readExpr)
+evalString :: Env -> String -> IO String
+evalString env expr = runIOThrows $ liftM show $ (liftThrows $ readExpr expr) >>= eval env
 
-evalAndPrint :: String -> IO ()
-evalAndPrint = putStrLn <=< evalString
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr = evalString env expr >>= putStrLn
 
 -- loops until the predicate V  is true
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
-until_ pred prompt action = do
+until_ predicate prompt action = do
   result <- prompt
-  if pred result
+  if predicate result
     then return ()
-    else action result >> until_ pred prompt action
+    else action result >> until_ predicate prompt action
 
 runRepl :: IO ()
-runRepl = until_ (== "quit") (readPrompt "Scheme λ: ") evalAndPrint
+runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Scheme λ: ") . evalAndPrint
 
 type Env = IORef [(String, IORef LispVal)]
 
@@ -472,10 +484,60 @@ nullEnv = newIORef []
 -- a combined monad for LispErrors and IO
 type IOThrowsError = ExceptT LispError IO
 
+-- a lifting function from our old monad to the combined one
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err)  = throwError err
+liftThrows (Right val) = return val
+
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows = (<&> extractValue) . runExceptT . trapError
+
+isBound :: Env -> String -> IO Bool
+isBound envRef var = readIORef envRef <&> (isJust . lookup var)
+
+getVar :: Env -> String -> IOThrowsError LispVal
+getVar envRef var = do
+  env <- liftIO $ readIORef envRef
+  maybe
+    (throwError $ UnboundVar "Getting an unbound variable" var)
+    (liftIO . readIORef)
+    (lookup var env)
+
+setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+setVar envRef var val = do
+  env <- liftIO $ readIORef envRef
+  maybe (throwError $ UnboundVar "Setting an unbound variable" var)
+    (liftIO . flip writeIORef val)
+    (lookup var env)
+  return val
+
+defVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+defVar envRef var val = do
+  alreadyDefined <- liftIO $ isBound envRef var
+  if alreadyDefined
+    then setVar envRef var val >> return val
+    else liftIO $ do
+      valRef <- newIORef val
+      env <- readIORef envRef
+      writeIORef envRef ((var, valRef):env)
+      return val
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef bindings = readIORef envRef
+                        >>= extendEnv bindings
+                        >>= newIORef
+  where
+    extendEnv binds env   = fmap (++ env) (mapM addBinding binds)
+    addBinding (var, val) = do ref <- newIORef val
+                               return (var, ref)
+
+runOne :: String -> IO ()
+runOne expr = nullEnv >>= flip evalAndPrint expr
+
 main :: IO ()
 main = do
   args <- getArgs
   case length args of
     0 -> runRepl
-    1 -> evalAndPrint $ head args
+    1 -> runOne $ head args
     _ -> putStrLn "No args to run REPL, 1 arg to evaluate it"
