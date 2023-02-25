@@ -1,16 +1,20 @@
+{-# LANGUAGE ExistentialQuantification #-}
+
 module Main where
 
-import Text.ParserCombinators.Parsec hiding (spaces)
-import System.Environment
-import Numeric (readOct, readHex)
+import           Control.Monad.Except
+import           Numeric                       (readHex, readOct)
+import           System.Environment
+import           Text.ParserCombinators.Parsec hiding (spaces)
+import           Data.Functor ((<&>))
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
 
-readExpr :: String -> LispVal
+readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
-  Left err -> String $ "No match: " ++ show err
-  Right v  -> v
+  Left err -> throwError $ Parser err
+  Right v  -> return v
 
 spaces :: Parser ()
 spaces = skipMany1 space
@@ -28,7 +32,62 @@ data LispVal
   -- | Character Char
   -- | Vector (Array Int LispVal)
 
+-- TODO: How to print the remaining?
+showVal :: LispVal -> String
+showVal (Atom name)       = name
+showVal (List xs)         = "(" ++ unwordsList xs ++ ")"
+showVal (DottedList xs x) = "(" ++ unwordsList xs ++ " . " ++ showVal x ++ ")"
+showVal (Number num)      = show num
+-- showVal (Float _num)      = undefined
+-- showVal (Ratio _num)      = undefined
+-- showVal (Complex _num)    = undefined
+showVal (String str)      = "\"" ++ str ++ "\""
+showVal (Bool True)       = "#t"
+showVal (Bool False)      = "#f"
+-- showVal (Character c)     = "\\#" ++ [c]
+-- showVal (Vector _vec)     = undefined
+
+unwordsList :: [LispVal] -> String
+unwordsList = unwords . map showVal
+
 instance Show LispVal where show = showVal
+
+data LispError
+  = NumArgs Integer [LispVal]
+  | TypeMismatch String LispVal
+  | Parser ParseError
+  | BadSpecialForm String LispVal
+  | NotFunction String String
+  | UnboundVar String String
+  | Default String
+
+showError :: LispError -> String
+showError (UnboundVar msg var)          = msg ++ ": " ++ var
+showError (BadSpecialForm msg form)     = msg ++ ": " ++ show form
+showError (NotFunction msg func)        = msg ++ ": " ++ show func
+showError (NumArgs expected found)      = "Expecteed "
+                                        ++ show expected
+                                        ++ " args; found values "
+                                        ++ unwordsList found
+showError (TypeMismatch expected found) = "Invalid type: expected "
+                                        ++ expected
+                                        ++ ", found "
+                                        ++ show found
+showError (Parser parseErr)             = "Parse error at " ++ show parseErr
+
+instance Show LispError where show = showError
+
+type ThrowsError = Either LispError
+
+trapError :: (MonadError e m, Show e) => m String -> m String
+trapError action = catchError action (return . show)
+
+extractValue :: ThrowsError a -> a
+extractValue (Right val) = val
+-- Should be called after trapError
+-- to guarantee a Right and no Left
+extractValue _           = undefined
+
 
 parseBool :: Parser LispVal
 parseBool = do
@@ -124,7 +183,7 @@ parseNumber = parseDecimal
            <|> parseBin
 
 parseDecimal :: Parser LispVal
-parseDecimal = many1 digit >>= (return . Number . read)
+parseDecimal = many1 digit <&> (Number . read)
 
 parsePrefixDecimal :: Parser LispVal
 parsePrefixDecimal = do
@@ -151,10 +210,10 @@ parseBin = do
   return $ Number $ bin2dig d
 
 oct2dig :: String -> Integer
-oct2dig = fst . (!! 0) . readOct
+oct2dig = fst . head . readOct
 
 hex2dig :: String -> Integer
-hex2dig = fst . (!! 0) . readHex
+hex2dig = fst . head . readHex
 
 bin2dig :: String -> Integer
 bin2dig = bin2dig' 0
@@ -230,56 +289,161 @@ parseExpr = parseAtom
                 _ <- char ')'
                 return x
 
--- TODO: How to print the remaining?
-showVal :: LispVal -> String
-showVal (Atom name)       = name
-showVal (List xs)         = "(" ++ unwordsList xs ++ ")"
-showVal (DottedList xs x) = "(" ++ unwordsList xs ++ " . " ++ showVal x ++ ")"
-showVal (Number num)      = show num
--- showVal (Float _num)      = undefined
--- showVal (Ratio _num)      = undefined
--- showVal (Complex _num)    = undefined
-showVal (String str)      = "\"" ++ str ++ "\""
-showVal (Bool True)       = "#t"
-showVal (Bool False)      = "#f"
--- showVal (Character c)     = "\\#" ++ [c]
--- showVal (Vector _vec)     = undefined
+eval :: LispVal -> ThrowsError LispVal
+eval val@(String _)              = return val
+eval val@(Number _)              = return val
+eval val@(Bool _)                = return val
+eval (List [Atom "quote", val])  = return val
+eval (List [Atom "if", p, a, b]) = -- if p then a else b
+  -- will evaluate #f as False and *everything* else as True
+  do result <- eval p
+     case result of
+          Bool False -> eval b
+          _          -> eval a
+eval (List (Atom func : args))   = mapM eval args >>= apply func
+eval badForm                     = throwError
+                                 $ BadSpecialForm "Unrecognized special form" badForm
 
-unwordsList :: [LispVal] -> String
-unwordsList = unwords . map showVal
+apply :: String -> [LispVal] -> ThrowsError LispVal
+apply func args = maybe
+  (throwError $ NotFunction "Unrecognized primitive function args" func)
+  ($ args)
+  (lookup func primitives)
 
-eval :: LispVal -> LispVal
-eval val@(String _)             = val
-eval val@(Number _)             = val
-eval val@(Bool _)               = val
-eval (List [Atom "quote", val]) = val
-eval (List (Atom func : args))  = apply func $ map eval args
+car :: [LispVal] -> ThrowsError LispVal
+car [List (x:_)]         = return x
+car [DottedList (x:_) _] = return x
+car [badArg]             = throwError $ TypeMismatch "pair" badArg
+car badArgList           = throwError $ NumArgs 1 badArgList
 
-apply :: String -> [LispVal] -> LispVal
-apply func args = maybe (Bool False) ($ args) $ lookup func primitives
+cdr :: [LispVal] -> ThrowsError LispVal
+cdr [List (_:xs)]         = return $ List xs
+cdr [DottedList [_] x]    = return x
+cdr [DottedList (_:xs) x] = return $ DottedList xs x
+cdr [badArg]              = throwError $ TypeMismatch "pair" badArg
+cdr badArgList            = throwError $ NumArgs 1 badArgList
 
-primitives :: [(String, [LispVal] -> LispVal)]
-primitives = [("+",         numericBinop (+)),
-              ("-",         numericBinop (-)),
-              ("*",         numericBinop (*)),
-              ("/",         numericBinop div),
-              ("mod",       numericBinop mod),
-              ("quotient",  numericBinop quot),
-              ("remainder", numericBinop rem)]
+cons :: [LispVal] -> ThrowsError LispVal
+cons [x, List []]         = return     $ List [x]
+cons [x, List xs]         = return     $ List (x:xs)
+cons [x, DottedList xs y] = return     $ DottedList (x:xs) y
+cons [x, y]               = return     $ DottedList [x] y
+cons badArgList           = throwError $ NumArgs 2 badArgList
 
-numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> LispVal
-numericBinop op params = Number $ foldl1 op $ map unpackNum params
+eqv :: [LispVal] -> ThrowsError LispVal
+eqv [Bool x, Bool y]                   = return $ Bool $ x == y
+eqv [Number x, Number y]               = return $ Bool $ x == y
+eqv [String x, String y]               = return $ Bool $ x == y
+eqv [Atom x, Atom y]                   = return $ Bool $ x == y
+eqv [DottedList xs x, DottedList ys y] = eqv [List $ xs ++ [x], List $ ys ++ [y]]
+eqv [List xs, List ys]                 = return
+                                       $ Bool
+                                       $ length xs == length ys
+                                       && all eqvPair (zip xs ys)
+eqv [_, _]                             = return $ Bool False
+eqv badArgList                         = throwError $ NumArgs 2 badArgList
 
-unpackNum :: LispVal -> Integer
-unpackNum (Number n) = n
-unpackNum (List [n]) = unpackNum n
-unpackNum (String n) = let parsed = reads n :: [(Integer, String)] in
+eqvPair :: (LispVal, LispVal) -> Bool
+eqvPair (x, y) =
+  case eqv [x, y] of
+    Right (Bool v) -> v
+    -- these will not happen, as eqv only error if it gets not 2 args
+    Left _         -> False
+    _              -> undefined
+
+primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
+primitives = [("+",         numericBinop  (+) ),
+              ("-",         numericBinop  (-) ),
+              ("*",         numericBinop  (*) ),
+              ("/",         numericBinop  div ),
+              ("mod",       numericBinop  mod ),
+              ("quotient",  numericBinop  quot),
+              ("remainder", numericBinop  rem ),
+              ("=",         numBoolBinop  (==)),
+              ("<",         numBoolBinop  (<) ),
+              (">",         numBoolBinop  (>) ),
+              ("/=",        numBoolBinop  (/=)),
+              (">=",        numBoolBinop  (>=)),
+              ("<=",        numBoolBinop  (<=)),
+              ("&&",        boolBoolBinop (&&)),
+              ("||",        boolBoolBinop (||)),
+              ("string=?",  strBoolBinop  (==)),
+              ("string<?",  strBoolBinop  (<) ),
+              ("string>?",  strBoolBinop  (>) ),
+              ("string<=?", strBoolBinop  (<=)),
+              ("string>=?", strBoolBinop  (>=)),
+              ("car",       car               ),
+              ("cdr",       cdr               ),
+              ("cons",      cons              ),
+              ("eq?",       eqv               ),
+              ("eqv?",      eqv               ),
+              ("equal?",    equal             )]
+
+numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
+numericBinop _ []            = throwError $ NumArgs 2 []
+numericBinop _ singleVal@[_] = throwError $ NumArgs 2 singleVal
+numericBinop op args         = mapM unpackNum args <&> (Number . foldl1 op)
+
+boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsError LispVal
+boolBinop unpacker op args =
+  if length args /= 2
+  then throwError $ NumArgs 2 args
+  else do
+    -- list indexing is has been bounds checked by if-predicate
+    left  <- unpacker $ args !! 0
+    right <- unpacker $ args !! 1
+    return $ Bool $ left `op` right
+
+
+numBoolBinop ::  (Integer -> Integer -> Bool) -> [LispVal] -> ThrowsError LispVal
+strBoolBinop ::  (String  -> String  -> Bool) -> [LispVal] -> ThrowsError LispVal
+boolBoolBinop :: (Bool    -> Bool    -> Bool) -> [LispVal] -> ThrowsError LispVal
+
+numBoolBinop  = boolBinop unpackNum
+strBoolBinop  = boolBinop unpackStr
+boolBoolBinop = boolBinop unpackBool
+
+unpackNum :: LispVal -> ThrowsError Integer
+unpackNum (Number n) = return n
+unpackNum (String n) = let parsed = reads n in
                            if null parsed
-                              then 0
-                              else fst $ parsed !! 0
-unpackNum _          = 0
+                              then throwError $ TypeMismatch "number" $ String n
+                              else return $ fst $ head parsed
+unpackNum (List [n]) = unpackNum n
+unpackNum notNum     = throwError $ TypeMismatch "number" notNum
 
+unpackStr :: LispVal -> ThrowsError String
+unpackStr (String str) = return str
+unpackStr (Number num) = return $ show num
+unpackStr (Bool bool)  = return $ show bool
+unpackStr notString    = throwError $ TypeMismatch "string" notString
+
+unpackBool :: LispVal -> ThrowsError Bool
+unpackBool (Bool bool) = return bool
+unpackBool notBool     = throwError $ TypeMismatch "boolean" notBool
+
+data Unpacker = forall a. Eq a => AnyUnpacker (LispVal -> ThrowsError a)
+
+unpackEquals :: LispVal -> LispVal -> Unpacker -> ThrowsError Bool
+unpackEquals a b (AnyUnpacker unpacker) =
+  do ua <- unpacker a
+     ub <- unpacker b
+     return $ ua == ub
+     `catchError` const (return False)
+
+equal :: [LispVal] -> ThrowsError LispVal
+equal [a, b]      = do
+  primitiveEquals <- or <$> mapM (unpackEquals a b)
+    [AnyUnpacker unpackNum, AnyUnpacker unpackStr, AnyUnpacker unpackBool]
+  eqvEquals <- eqv [a, b]
+  return $ Bool (primitiveEquals || let (Bool x) = eqvEquals in x)
+equal badArgList = throwError $ NumArgs 2 badArgList
+
+flushStr :: String -> IO ()
+flushStr = (>> hFlush stdout) . putStr
 
 main :: IO ()
 main = do
-  getArgs >>= print . eval . readExpr . head
+  args <- getArgs
+  let evaled = fmap show $ readExpr (head args) >>= eval
+  putStrLn $ extractValue $ trapError evaled
