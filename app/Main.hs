@@ -7,6 +7,7 @@ import           Numeric                       (readHex, readOct)
 import           System.Environment
 import           Text.ParserCombinators.Parsec hiding (spaces)
 import           Data.Functor ((<&>))
+import           System.IO
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -442,8 +443,30 @@ equal badArgList = throwError $ NumArgs 2 badArgList
 flushStr :: String -> IO ()
 flushStr = (>> hFlush stdout) . putStr
 
+readPrompt :: String -> IO String
+readPrompt = (>> getLine) . flushStr
+
+evalString :: String -> IO String
+evalString = return . extractValue . trapError . fmap show . (eval <=< readExpr)
+
+evalAndPrint :: String -> IO ()
+evalAndPrint = putStrLn <=< evalString
+
+-- loops until the predicate V  is true
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ pred prompt action = do
+  result <- prompt
+  if pred result
+    then return ()
+    else action result >> until_ pred prompt action
+
+runRepl :: IO ()
+runRepl = until_ (== "quit") (readPrompt "Scheme λ: ") evalAndPrint
+
 main :: IO ()
 main = do
   args <- getArgs
-  let evaled = fmap show $ readExpr (head args) >>= eval
-  putStrLn $ extractValue $ trapError evaled
+  case length args of
+    0 -> runRepl
+    1 -> evalAndPrint $ head args
+    otherwise -> putStrLn "No args to run REPL, 1 arg to evaluate it"
