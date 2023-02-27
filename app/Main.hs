@@ -7,7 +7,7 @@ import           Text.ParserCombinators.Parsec hiding (spaces)
 import           Data.Functor ((<&>))
 import           System.IO
 import           Data.IORef
-import           Data.Maybe (isJust)
+import           Data.Maybe (isJust, isNothing)
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -30,8 +30,18 @@ data LispVal
   -- | Complex (Complex Double)
   | String String
   | Bool Bool
+  | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+  | Func { params  :: [String]
+         , vararg  :: Maybe String
+         , body    :: [LispVal]
+         , closure :: Env
+         }
+  | IOFunc ([LispVal] -> IOThrowsError LispVal)
+  | Port Handle
   -- | Character Char
   -- | Vector (Array Int LispVal)
+
+type Env = IORef [(String, IORef LispVal)]
 
 -- TODO: How to print the remaining?
 showVal :: LispVal -> String
@@ -45,6 +55,17 @@ showVal (Number num)      = show num
 showVal (String str)      = "\"" ++ str ++ "\""
 showVal (Bool True)       = "#t"
 showVal (Bool False)      = "#f"
+showVal (PrimitiveFunc _) = "<primitive>"
+showVal (Port _)          = "<IO port"
+showVal (IOFunc _)        = "<IO primitive"
+showVal (Func { params  = args
+              , vararg  = varargs
+              , body    = _
+              , closure = _ }) =
+  "(lambda (" ++ unwords (map show args) ++
+    (case varargs of
+        Nothing  -> ""
+        Just arg -> " . " ++ arg) ++ ") ... )"
 -- showVal (Character c)     = "\\#" ++ [c]
 -- showVal (Vector _vec)     = undefined
 
@@ -291,6 +312,10 @@ parseExpr = parseAtom
                 _ <- char ')'
                 return x
 
+primitiveBindings :: IO Env
+primitiveBindings = nullEnv >>= flip bindVars (map makePrimitiveFunc primitives)
+  where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
+
 eval :: Env -> LispVal -> IOThrowsError LispVal
 eval _ val@(String _)
   = return val
@@ -313,16 +338,46 @@ eval env (List [Atom "set!", Atom var, form])
   = eval env form >>= setVar env var
 eval env (List [Atom "define", Atom var, form])
   = eval env form >>= defVar env var
-eval env (List (Atom func:args))
-  = mapM (eval env) args >>= liftThrows . apply func
+eval env (List (Atom "define" : List (Atom var : params') : body'))
+  = makeNormalFunc env params' body' >>= defVar env var
+eval env (List (Atom "define" : DottedList (Atom var : params') varargs : body'))
+  = makeVarArgs varargs env params' body' >>= defVar env var
+eval env (List (Atom "lambda" : List params' : body'))
+  = makeNormalFunc env params' body'
+eval env (List (Atom "lambda" : DottedList params' varargs : body'))
+  = makeVarArgs varargs env params' body'
+eval env (List (Atom "lambda" : varargs@(Atom _) : body'))
+  = makeVarArgs varargs env [] body'
+eval env (List (function:args))
+  = do func <- eval env function
+       argVals <- mapM (eval env) args
+       apply func argVals
 eval _ badForm
   = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> ThrowsError LispVal
-apply fn args = maybe
-  (throwError $ NotFunction "Unrecognized primitive function args" fn)
-  ($ args)
-  (lookup fn primitives)
+makeFunc :: Maybe String -> Env -> [LispVal] -> [LispVal] -> IOThrowsError LispVal
+makeFunc varargs env params' body' = return $ Func (map showVal params') varargs body' env
+
+makeNormalFunc :: Env -> [LispVal] -> [LispVal] -> IOThrowsError LispVal
+makeNormalFunc = makeFunc Nothing
+
+makeVarArgs :: LispVal -> Env -> [LispVal] -> [LispVal] -> IOThrowsError LispVal
+makeVarArgs = makeFunc . Just . showVal
+
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func params' varargs' body' closure') args =
+  if num params' /= num args && isNothing varargs'
+    then throwError $ NumArgs (num params') args
+    else liftIO (bindVars closure' $ zip params' args) >>= bindVarArgs varargs' >>= evalBody
+  where
+    remainingArgs       = drop (length params') args
+    num                 = toInteger . length
+    evalBody env        = last <$> mapM (eval env) body'
+    bindVarArgs arg env = case arg of
+      Just argName -> liftIO $ bindVars env [(argName, List remainingArgs)]
+      Nothing      -> return env
+apply _ _ = undefined -- it is guaranteed
 
 car :: [LispVal] -> ThrowsError LispVal
 car [List (x:_)]         = return x
@@ -453,34 +508,6 @@ equal [a, b]      = do
   return $ Bool (primitiveEquals || let (Bool x) = eqvEquals in x)
 equal badArgList = throwError $ NumArgs 2 badArgList
 
-flushStr :: String -> IO ()
-flushStr = (>> hFlush stdout) . putStr
-
-readPrompt :: String -> IO String
-readPrompt = (>> getLine) . flushStr
-
-evalString :: Env -> String -> IO String
-evalString env expr = runIOThrows $ liftM show $ (liftThrows $ readExpr expr) >>= eval env
-
-evalAndPrint :: Env -> String -> IO ()
-evalAndPrint env expr = evalString env expr >>= putStrLn
-
--- loops until the predicate V  is true
-until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
-until_ predicate prompt action = do
-  result <- prompt
-  if predicate result
-    then return ()
-    else action result >> until_ predicate prompt action
-
-runRepl :: IO ()
-runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Scheme λ: ") . evalAndPrint
-
-type Env = IORef [(String, IORef LispVal)]
-
-nullEnv :: IO Env
-nullEnv = newIORef []
-
 -- a combined monad for LispErrors and IO
 type IOThrowsError = ExceptT LispError IO
 
@@ -531,8 +558,34 @@ bindVars envRef bindings = readIORef envRef
     addBinding (var, val) = do ref <- newIORef val
                                return (var, ref)
 
+flushStr :: String -> IO ()
+flushStr = (>> hFlush stdout) . putStr
+
+readPrompt :: String -> IO String
+readPrompt = (>> getLine) . flushStr
+
+evalString :: Env -> String -> IO String
+evalString env expr = runIOThrows $ fmap show $ liftThrows (readExpr expr) >>= eval env
+
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr = evalString env expr >>= putStrLn
+
+-- loops until the predicate V  is true
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ predicate prompt action = do
+  result <- prompt
+  if predicate result
+    then return ()
+    else action result >> until_ predicate prompt action
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+runRepl :: IO ()
+runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Scheme λ: ") . evalAndPrint
+
 runOne :: String -> IO ()
-runOne expr = nullEnv >>= flip evalAndPrint expr
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
 
 main :: IO ()
 main = do
